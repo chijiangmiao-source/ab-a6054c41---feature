@@ -52,7 +52,7 @@
 <body>
 <header>
   <h1>隔离维护站 · 设备指令委托链裁决</h1>
-  <span class="sub">Ed25519 逐级签名 · 范围严格收窄 · 末级凭据一次性 · 持久化裁决与稳定回执</span>
+  <span class="sub">Ed25519 逐级签名 · 范围严格收窄 · 末级凭据一次性 · 执行凭据确认 · 持久化裁决与稳定回执</span>
   <span id="health" class="pill">健康检查中…</span>
 </header>
 <main>
@@ -72,7 +72,8 @@
   </div>
 
   <div class="btns" style="margin:16px 0">
-    <button id="inspect" class="primary">逐级核验（不执行）</button>
+    <button id="attest" class="primary">逐级核验并签发执行凭据</button>
+    <button id="inspect">逐级核验（不执行）</button>
     <button id="execute" class="danger">发起一次执行</button>
     <button id="refresh"><span style="font-family:var(--mono)">↻</span> 刷新裁决台账</button>
   </div>
@@ -80,6 +81,24 @@
   <div id="banner" class="banner"></div>
 
   <div class="grid">
+    <section class="panel full" id="credPanel" style="display:none">
+      <h2>执行凭据 · 与裁决身份持久绑定（确认执行前请逐项核对）</h2>
+      <dl class="kv">
+        <dt>凭据标识</dt><dd id="c-id" class="mono">-</dd>
+        <dt>绑定链摘要 chain_digest</dt><dd id="c-chain" class="mono">-</dd>
+        <dt>绑定载荷摘要 payload_digest</dt><dd id="c-payload" class="mono">-</dd>
+        <dt>裁决标识 request_digest</dt><dd id="c-req" class="mono">-</dd>
+        <dt>叶项标识 leaf_id</dt><dd id="c-leaf" class="mono">-</dd>
+        <dt>有效状态</dt><dd id="c-status">-</dd>
+        <dt>签发时间</dt><dd id="c-time" class="mono">-</dd>
+      </dl>
+      <div class="btns">
+        <button id="confirm" class="primary">确认执行（以凭据绑定内容为准）</button>
+      </div>
+      <p class="muted" style="margin:8px 0 0">确认执行会重新核对当前两个输入框的内容与凭据绑定的链/载荷摘要；
+      任何设备、命令、签名字段或请求载荷变化都将被明确拒绝且不会驱动设备；链项过期或被撤销同样拒绝。</p>
+    </section>
+
     <section class="panel full">
       <h2>裁决身份要素</h2>
       <dl class="kv">
@@ -183,19 +202,45 @@ function renderEvaluation(ev) {
   }
 }
 
-async function submit(path, okMsg) {
+let currentCredential = null;
+
+function statusPill(s) {
+  if (s === "ACTIVE") return '<span class="pill ok">有效 · 待确认</span>';
+  if (s === "EXECUTED") return '<span class="pill ok">已执行（凭据已用）</span>';
+  if (s === "REJECTED") return '<span class="pill bad">裁决已拒绝</span>';
+  if (s === "REVOKED") return '<span class="pill bad">已撤销失效</span>';
+  return `<span class="pill">${s || "-"}</span>`;
+}
+
+function renderCredential(c) {
+  currentCredential = c || null;
+  const p = $("credPanel");
+  if (!c) { p.style.display = "none"; return; }
+  p.style.display = "";
+  $("c-id").textContent = c.credential_id || "-";
+  $("c-chain").textContent = c.chain_digest || "-";
+  $("c-payload").textContent = c.payload_digest || "-";
+  $("c-req").textContent = c.request_digest || "-";
+  $("c-leaf").textContent = c.leaf_id || "-";
+  $("c-status").innerHTML = statusPill(c.status);
+  $("c-time").textContent = fmtTs(c.created_at);
+}
+
+async function submit(path, okMsg, extra) {
   let body;
   try {
-    body = JSON.stringify({ packet_text: $("packet").value, request_text: $("request").value });
-  } catch (e) { setBanner(false, "输入无法序列化：" + e); return; }
+    body = JSON.stringify(Object.assign(
+      { packet_text: $("packet").value, request_text: $("request").value }, extra || {}));
+  } catch (e) { setBanner(false, "输入无法序列化：" + e); return null; }
   let j;
   try {
     const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body});
     j = await r.json();
-  } catch (e) { setBanner(false, "请求失败：" + e); return; }
+  } catch (e) { setBanner(false, "请求失败：" + e); return null; }
   if (j.detail) {
     setBanner(false, `${j.detail.code || "ERROR"}：${j.detail.message || ""}`);
-    return;
+    if (j.detail.code === "CREDENTIAL_UNKNOWN") renderCredential(null);
+    return j;
   }
   renderEvaluation(j.evaluation);
   if (j.receipt) {
@@ -209,10 +254,35 @@ async function submit(path, okMsg) {
     setBanner(true, `${okMsg}${j.duplicate ? "（命中既有裁决：这是重传/并发收敛后的同一回执，设备未重复执行）" : ""}`);
   } else {
     setBanner(false, `裁决拒绝：${j.evaluation.first_reason} — ${j.evaluation.first_reason_text || ""}` +
-      (j.receipt ? "（已落 REJECTED 裁决，绝无执行记录）" : ""));
+      (j.receipt ? "（已落 REJECTED 裁决，绝无执行记录）" : "（未落任何裁决记录）"));
   }
   refreshLedger(); checkHealth();
+  return j;
 }
+
+$("loadDrill").onclick = () => loadDrill("valid");
+$("loadRevoked").onclick = () => loadDrill("revoked");
+$("attest").onclick = async () => {
+  const j = await submit("/api/attest", "逐级核验通过：执行凭据已签发并与裁决身份持久绑定，请核对后确认执行。");
+  // 核验失败不得产生可用凭据：清空凭据面板
+  renderCredential(j && j.credential ? j.credential : null);
+};
+$("inspect").onclick = async () => {
+  renderCredential(null);
+  await submit("/api/inspect", "逐级核验通过（未执行、未落盘）。");
+};
+$("execute").onclick = async () => {
+  renderCredential(null);
+  await submit("/api/execute", "执行成功：裁决已持久化。");
+};
+$("confirm").onclick = async () => {
+  if (!currentCredential) { setBanner(false, "当前无可用执行凭据，请先“逐级核验并签发执行凭据”。"); return; }
+  const j = await submit("/api/confirm", "确认执行成功：裁决已持久化。",
+    { credential_id: currentCredential.credential_id });
+  if (j && j.credential) renderCredential(j.credential);  // 刷新凭据有效状态
+};
+$("refresh").onclick = refreshLedger;
+checkHealth(); refreshLedger();
 
 async function refreshLedger() {
   const j = await (await fetch("/api/decisions?limit=20")).json();
@@ -230,13 +300,6 @@ async function refreshLedger() {
     tb.appendChild(tr);
   }
 }
-
-$("loadDrill").onclick = () => loadDrill("valid");
-$("loadRevoked").onclick = () => loadDrill("revoked");
-$("inspect").onclick = () => submit("/api/inspect", "逐级核验通过（未执行、未落盘）。");
-$("execute").onclick = () => submit("/api/execute", "执行成功：裁决已持久化。");
-$("refresh").onclick = refreshLedger;
-checkHealth(); refreshLedger();
 </script>
 </body>
 </html>

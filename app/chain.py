@@ -72,6 +72,9 @@ REASON_DEVICE_OUT_OF_SCOPE = "DEVICE_OUT_OF_SCOPE"
 REASON_COMMAND_OUT_OF_SCOPE = "COMMAND_OUT_OF_SCOPE"
 REASON_LEAF_CONSUMED = "LEAF_CONSUMED"  # 运行期：末级凭据已使用
 REASON_REVOCATION_INVALID = "REVOCATION_INVALID"
+# 确认执行流程（/api/confirm）特有的拒因：凭据本身问题，不属于链裁决顺序
+REASON_CREDENTIAL_UNKNOWN = "CREDENTIAL_UNKNOWN"
+REASON_CREDENTIAL_MISMATCH = "CREDENTIAL_MISMATCH"
 
 REASON_TEXT = {
     REASON_MALFORMED_JSON: "委托包不是规范 UTF-8 JSON（含重复键/非法编码）",
@@ -90,6 +93,8 @@ REASON_TEXT = {
     REASON_DEVICE_OUT_OF_SCOPE: "请求设备超出叶项设备范围",
     REASON_COMMAND_OUT_OF_SCOPE: "请求命令超出叶项命令集合",
     REASON_LEAF_CONSUMED: "该末级凭据已使用过，不得再次驱动设备",
+    REASON_CREDENTIAL_UNKNOWN: "执行凭据不存在（未签发或标识非法）",
+    REASON_CREDENTIAL_MISMATCH: "提交内容与执行凭据绑定的裁决身份不一致（设备/命令/签名字段/载荷已被改动）",
 }
 
 ROOT_ANCHOR_DIGEST = "0" * 64
@@ -475,6 +480,19 @@ def request_digest(
     h.update(bytes.fromhex(leaf_id_hex))
     h.update(canonical_bytes(payload))
     return h.hexdigest()
+
+
+def credential_id_of(request_digest_hex: str) -> str:
+    """执行凭据标识：由裁决标识单向派生。
+
+    凭据与签发时刻规范化后的裁决身份一一对应，因此同一裁决身份无论何时
+    （含重启后）核验通过都派生出同一凭据标识，可复核、可比对；凭据本身
+    不含任何授权信息，确认执行时仍需重新核对并走完整裁决。
+    """
+    h = hashlib.sha256()
+    h.update(b"MDMS-CRED-v1\n")
+    h.update(bytes.fromhex(request_digest_hex))
+    return "cdl-" + h.hexdigest()
 
 
 def short_id(value: str | None, length: int = 12) -> str:

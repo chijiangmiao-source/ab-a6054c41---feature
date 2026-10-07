@@ -5,7 +5,9 @@
   1. 有效执行：加载/构造合法委托链 → EXECUTED，回执可按 request_digest 复核；
   2. 并发重传：同叶项同载荷并发 12 次 → 恰好一次执行、回执逐字相同；
   3. 篡改拒绝：改已签字段 / 越权命令 / 过期 / 撤销 / 剥离撤销重放 / 二次使用；
-  4. 冒烟：healthz、静态页面、内置演练包、畸形 JSON 400。
+  4. 执行凭据：核验通过才签发凭据、确认执行收敛、替换内容/未知凭据拒绝、
+     旧凭据不得绕过撤销；
+  5. 冒烟：healthz、静态页面、内置演练包、畸形 JSON 400。
 
 先运行 pytest 全量测试，再做在线 HTTP 场景；任一步失败即以非零状态码退出。
 """
@@ -211,8 +213,105 @@ def scenario_tamper_rejections() -> None:
           r.status_code == 400 and r.json().get("detail", {}).get("code") == C.REASON_MALFORMED_JSON)
 
 
+def scenario_credential_confirm_flow() -> None:
+    print("\n=== 场景 4：执行凭据签发与确认执行 ===")
+    keys, levels = fresh_keys_and_levels()
+    payload = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    body = envelope(keys, levels, payload)
+
+    # 4.1 核验通过 → 签发凭据；凭据绑定链/载荷摘要，且不产生裁决记录
+    r = httpx.post(BASE_URL + "/api/attest", json=body, timeout=TIMEOUT)
+    j = r.json()
+    cred = j.get("credential") or {}
+    check("核验通过签发执行凭据", r.status_code == 200 and j.get("accepted") is True
+          and cred.get("credential_id", "").startswith("cdl-"))
+    check("凭据绑定链摘要与载荷摘要且状态有效",
+          cred.get("chain_digest") == j["evaluation"]["chain_digest"]
+          and cred.get("payload_digest")
+          and cred.get("status") == "ACTIVE")
+    digest = cred.get("request_digest")
+    ledger = httpx.get(BASE_URL + "/api/decisions?limit=200", timeout=TIMEOUT).json()["decisions"]
+    check("签发凭据不落裁决记录", all(d["request_digest"] != digest for d in ledger))
+
+    # 4.2 确认执行 → EXECUTED；同一确认重传收敛为同一回执
+    def confirm(b):
+        return httpx.post(BASE_URL + "/api/confirm",
+                          json={**b, "credential_id": cred["credential_id"]}, timeout=30)
+
+    j1 = confirm(body).json()
+    check("凭据确认执行成功", j1.get("accepted") is True
+          and (j1.get("receipt") or {}).get("status") == "EXECUTED",
+          str(j1.get("evaluation", {}).get("first_reason")))
+    j2 = confirm(body).json()
+    check("同一确认重传收敛为同一回执",
+          j2.get("receipt") == j1.get("receipt") and j2.get("duplicate") is True)
+
+    # 4.3 两个"页面"并发使用同一凭据确认同一请求 → 恰好一次执行
+    keys2, levels2 = fresh_keys_and_levels()
+    payload2 = {"device": "dev-b", "command": "reboot", "nonce": os.urandom(8).hex()}
+    body2 = envelope(keys2, levels2, payload2)
+    cred2 = httpx.post(BASE_URL + "/api/attest", json=body2, timeout=TIMEOUT).json()["credential"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        js = [r.json() for r in pool.map(
+            lambda _: httpx.post(BASE_URL + "/api/confirm",
+                                 json={**body2, "credential_id": cred2["credential_id"]},
+                                 timeout=30),
+            range(12))]
+    receipts = {json.dumps(x.get("receipt"), sort_keys=True) for x in js}
+    check("并发确认同一凭据：回执完全相同且恰好一次首执行",
+          len(receipts) == 1 and sum(1 for x in js if x.get("duplicate") is False) == 1)
+    leaf2 = js[0]["receipt"]["leaf_id"]
+    ledger = httpx.get(BASE_URL + "/api/decisions?limit=200", timeout=TIMEOUT).json()["decisions"]
+    check("并发确认：该叶项执行记录恰好一条",
+          len([d for d in ledger if d["status"] == "EXECUTED" and d["leaf_id"] == leaf2]) == 1)
+
+    # 4.4 页面间隙被替换：设备/命令/载荷与凭据绑定不一致 → 明确拒绝且不驱动设备
+    swapped = envelope(keys, levels,
+                       {"device": "dev-b", "command": "reboot", "nonce": os.urandom(8).hex()})
+    j3 = confirm(swapped).json()
+    check("替换载荷 → CREDENTIAL_MISMATCH 且不驱动设备",
+          j3.get("accepted") is False
+          and j3.get("evaluation", {}).get("first_reason") == C.REASON_CREDENTIAL_MISMATCH
+          and j3.get("receipt") is None)
+
+    def tamper_signed(packet, chain, ks):
+        packet["chain"][-1]["header"]["devices"].append("dev-z")
+
+    j4 = confirm(envelope(keys, levels, payload, packet_mut=tamper_signed)).json()
+    check("改动签名字段 → CREDENTIAL_MISMATCH",
+          j4.get("evaluation", {}).get("first_reason") == C.REASON_CREDENTIAL_MISMATCH)
+
+    # 4.5 未知凭据 → 404 CREDENTIAL_UNKNOWN
+    r5 = httpx.post(BASE_URL + "/api/confirm",
+                    json={**body, "credential_id": "cdl-" + "0" * 64}, timeout=TIMEOUT)
+    check("未知凭据 → 404 CREDENTIAL_UNKNOWN",
+          r5.status_code == 404
+          and r5.json().get("detail", {}).get("code") == C.REASON_CREDENTIAL_UNKNOWN)
+
+    # 4.6 旧凭据不得绕过撤销：签发后叶项被撤销，确认必须拒绝
+    keys3, levels3 = fresh_keys_and_levels()
+    payload3 = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    body3 = envelope(keys3, levels3, payload3)
+    cred3 = httpx.post(BASE_URL + "/api/attest", json=body3, timeout=TIMEOUT).json()["credential"]
+    chain3 = testkit.make_chain(keys3["root"], levels3, FAR_FUTURE)
+    leaf3 = C.item_id_of(chain3[-1]["header"])
+    crl = testkit.make_revocation(keys3["root"], [leaf3], FAR_FUTURE)
+    packet3 = testkit.make_packet(keys3["root"], chain3, revocations=[crl])
+    other = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    post_execute({"packet_text": canonicalize(packet3),
+                  "request_text": canonicalize(
+                      {"payload": other, "payload_signature": sign_payload(keys3["leaf"], other)})})
+    j6 = httpx.post(BASE_URL + "/api/confirm",
+                    json={**body3, "credential_id": cred3["credential_id"]},
+                    timeout=TIMEOUT).json()
+    check("签发后叶项被撤销 → 旧凭据确认仍 REVOKED 且不驱动设备",
+          j6.get("accepted") is False
+          and j6.get("evaluation", {}).get("first_reason") == C.REASON_REVOKED
+          and leaf3 not in executed_leaf_ids())
+
+
 def scenario_http_smoke() -> None:
-    print("\n=== 场景 4：健康/页面/内置演练包冒烟 ===")
+    print("\n=== 场景 5：健康/页面/内置演练包冒烟 ===")
     h = httpx.get(BASE_URL + "/healthz", timeout=TIMEOUT)
     check("GET /healthz → 200 status=ok",
           h.status_code == 200 and h.json().get("status") == "ok")
@@ -240,7 +339,7 @@ def scenario_http_smoke() -> None:
 
 
 def run_pytest_suite() -> bool:
-    print("\n=== 场景 5：pytest 全量单元/集成测试 ===")
+    print("\n=== 场景 6：pytest 全量单元/集成测试 ===")
     env = os.environ.copy()
     env["MDMS_DB_PATH"] = "/tmp/mdms-verify.db"
     env["PYTHONPATH"] = str(SRV_DIR)
@@ -260,6 +359,7 @@ def main() -> int:
     scenario_valid_execution_and_retry()
     scenario_concurrent_retransmit()
     scenario_tamper_rejections()
+    scenario_credential_confirm_flow()
     scenario_http_smoke()
     pytest_ok = run_pytest_suite()
 

@@ -1,8 +1,12 @@
 """持久化裁决层。
 
-两张表（SQLite，落盘到可挂载卷）：
+三张表（SQLite，落盘到可挂载卷）：
 - decisions       ：每个 request_digest 恰好一行的裁决（EXECUTED / REJECTED）；
-- consumed_leaves ：已驱动过设备的末级凭据（leaf_id），用于"一次性凭据"。
+- consumed_leaves ：已驱动过设备的末级凭据（leaf_id），用于"一次性凭据"；
+- credentials     ：核验通过后签发的执行凭据，与当时规范化后的裁决身份
+                    （root_pubkey / chain_digest / leaf_id / 规范载荷 → request_digest）
+                    持久绑定；凭据只是"已核验内容"的引用，确认执行时仍须重新
+                    核对输入并走完整裁决，绝不单独授权驱动设备。
 
 并发提交 / 响应丢失重传的收敛由单写事务保证：
 ``BEGIN IMMEDIATE`` 立即取 RESERVED 写锁，后到者在锁上等待后必能读到
@@ -12,6 +16,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import threading
@@ -46,6 +51,15 @@ CREATE TABLE IF NOT EXISTS revoked_leaves (
     leaf_id     TEXT PRIMARY KEY,
     revoked_at  INTEGER NOT NULL,
     source      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS credentials (
+    credential_id  TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    root_pubkey    TEXT NOT NULL,
+    chain_digest   TEXT NOT NULL,
+    leaf_id        TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    created_at     INTEGER NOT NULL
 );
 """
 
@@ -84,6 +98,38 @@ class Decision:
             "payload": self.payload,
             "created_at": self.created_at,
             "executed_at": self.executed_at,
+        }
+
+
+@dataclass
+class Credential:
+    """核验通过后签发的执行凭据（与裁决身份持久绑定的引用，不含授权语义）。"""
+
+    credential_id: str
+    request_digest: str
+    root_pubkey: str
+    chain_digest: str
+    leaf_id: str
+    payload: dict[str, Any]
+    created_at: int
+    duplicate: bool = False    # 本次签发是否命中既有凭据（同一裁决身份重复核验）
+
+    @property
+    def payload_digest(self) -> str:
+        return hashlib.sha256(canonical_bytes(self.payload)).hexdigest()
+
+    def view(self, status: str) -> dict[str, Any]:
+        """供界面复核的凭据视图：标识、绑定的链与载荷摘要、有效状态。"""
+        return {
+            "credential_id": self.credential_id,
+            "request_digest": self.request_digest,
+            "root_pubkey": self.root_pubkey,
+            "chain_digest": self.chain_digest,
+            "leaf_id": self.leaf_id,
+            "payload_digest": self.payload_digest,
+            "payload": self.payload,
+            "status": status,
+            "created_at": self.created_at,
         }
 
 
@@ -128,6 +174,72 @@ class DecisionStore:
     def revoked_set(self) -> set[str]:
         rows = self._conn().execute("SELECT leaf_id FROM revoked_leaves").fetchall()
         return {r["leaf_id"] for r in rows}
+
+    # ------------------------------------------------------------------ #
+    # 执行凭据：核验通过后签发，与当时规范化后的裁决身份持久绑定。
+    # 凭据标识由 request_digest 单向派生，同一裁决身份重复核验得到同一凭据；
+    # 确认执行时仍须重新核对输入并走完整裁决，凭据自身不授权任何设备动作。
+    def issue_credential(
+        self,
+        root_pubkey: str,
+        chain_digest: str,
+        leaf_id: str,
+        payload: dict[str, Any],
+    ) -> Credential:
+        digest = chain_mod.request_digest(root_pubkey, chain_digest, leaf_id, payload)
+        credential_id = chain_mod.credential_id_of(digest)
+        payload_json = canonical_bytes(payload).decode("utf-8")
+        now = int(time.time())
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO credentials VALUES (?,?,?,?,?,?,?)",
+                (credential_id, digest, root_pubkey, chain_digest, leaf_id,
+                 payload_json, now),
+            )
+            created = cur.rowcount > 0
+            row = conn.execute(
+                "SELECT * FROM credentials WHERE credential_id = ?", (credential_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return self._row_to_credential(row, duplicate=not created)
+
+    def get_credential(self, credential_id: str) -> Credential | None:
+        row = self._conn().execute(
+            "SELECT * FROM credentials WHERE credential_id = ?", (credential_id,)
+        ).fetchone()
+        return self._row_to_credential(row, duplicate=False) if row else None
+
+    def credential_status(self, cred: Credential) -> str:
+        """凭据有效状态：已有裁决 → 裁决状态；叶项已入撤销名册 → REVOKED；否则 ACTIVE。"""
+        decision = self.get(cred.request_digest)
+        if decision is not None:
+            return decision.status  # EXECUTED | REJECTED
+        if cred.leaf_id in self.revoked_set():
+            return "REVOKED"
+        return "ACTIVE"
+
+    def credential_view(self, cred: Credential) -> dict[str, Any]:
+        return cred.view(self.credential_status(cred))
+
+    @staticmethod
+    def _row_to_credential(row: sqlite3.Row, duplicate: bool = False) -> Credential:
+        return Credential(
+            credential_id=row["credential_id"],
+            request_digest=row["request_digest"],
+            root_pubkey=row["root_pubkey"],
+            chain_digest=row["chain_digest"],
+            leaf_id=row["leaf_id"],
+            payload=chain_mod.parse_strict_json(row["payload_json"]),
+            created_at=row["created_at"],
+            duplicate=duplicate,
+        )
+
+    # ------------------------------------------------------------------ #
 
     def decide_execution(
         self,
