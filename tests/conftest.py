@@ -46,6 +46,14 @@ def valid_payload():
     return {"device": "dev-a", "command": "status", "nonce": "n-0001"}
 
 
+@pytest.fixture
+def store_factory(tmp_path):
+    def _make():
+        from app.store import DecisionStore
+        return DecisionStore(str(tmp_path / "mdms.db"))
+    return _make
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))

@@ -13,13 +13,6 @@ from conftest import FAR_FUTURE
 
 
 @pytest.fixture
-def store_factory(tmp_path):
-    def _make():
-        return DecisionStore(str(tmp_path / "mdms.db"))
-    return _make
-
-
-@pytest.fixture
 def scenario(keys, levels, valid_payload):
     chain = testkit.make_chain(keys["root"], levels, FAR_FUTURE)
     packet = testkit.make_packet(keys["root"], chain)

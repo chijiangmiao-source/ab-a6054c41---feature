@@ -85,12 +85,17 @@ def envelope(keys, levels, payload, *, chain_kw=None, packet_mut=None):
     }
 
 
-def post_execute(body: dict) -> tuple[int, dict]:
-    r = httpx.post(BASE_URL + "/api/execute", json=body, timeout=30)
+def post_json(path: str, body: dict) -> tuple[int, dict]:
+    r = httpx.post(BASE_URL + path, json=body, timeout=30)
     try:
         return r.status_code, r.json()
     except Exception:  # noqa: BLE001
         return r.status_code, {}
+
+
+def post_execute(body: dict) -> tuple[int, dict]:
+    code, j = post_json("/api/execute", body)
+    return code, j
 
 
 def executed_leaf_ids() -> set[str]:
@@ -211,8 +216,113 @@ def scenario_tamper_rejections() -> None:
           r.status_code == 400 and r.json().get("detail", {}).get("code") == C.REASON_MALFORMED_JSON)
 
 
+def scenario_execution_credentials() -> None:
+    print("\n=== 场景 4：核验凭据（签发 → 复核 → 确认执行；篡改/撤销/并发收敛）===")
+    # 4.1 核验通过签发凭据，确认执行一次；重放收敛
+    keys, levels = fresh_keys_and_levels()
+    payload = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    body = envelope(keys, levels, payload)
+    _, ji = post_json("/api/credential/issue", body)
+    check("核验通过签发执行凭据",
+          ji.get("accepted") is True and bool(ji.get("credential")),
+          str(ji.get("evaluation", {}).get("first_reason")))
+    cred = ji["credential"]
+    check("凭据含标识/状态/绑定摘要",
+          len(cred.get("token_id", "")) == 32 and cred.get("status") == "ISSUED"
+          and cred["binding"].get("chain_digest") and cred["binding"].get("leaf_id")
+          and cred["binding"].get("payload_digest") and cred.get("request_digest"),
+          str(cred))
+    g = httpx.get(BASE_URL + f"/api/credential/{cred['token_id']}", timeout=TIMEOUT)
+    check("凭据状态接口可复核且逐字一致", g.status_code == 200
+          and g.json().get("credential") == cred)
+
+    token = cred["token_id"]
+    _, jc = post_json("/api/credential/confirm", {"token_id": token, **body})
+    check("凭据确认执行 EXECUTED",
+          jc.get("accepted") is True and jc.get("receipt", {}).get("status") == "EXECUTED"
+          and jc.get("duplicate") is False and jc["credential"]["status"] == "USED",
+          str(jc.get("evaluation", {}).get("first_reason")))
+    receipt = jc["receipt"]
+    _, jc2 = post_json("/api/credential/confirm", {"token_id": token, **body})
+    check("同一凭据重放收敛同一回执",
+          jc2.get("receipt") == receipt and jc2.get("duplicate") is True)
+
+    # 4.2 核验失败不产生可用凭据（越权命令）
+    keys, levels = fresh_keys_and_levels()
+    bad = {"device": "dev-a", "command": "diagnose", "nonce": os.urandom(8).hex()}
+    _, jf = post_json("/api/credential/issue", envelope(keys, levels, bad))
+    check("核验失败不产生凭据",
+          jf.get("accepted") is False and jf.get("credential") is None
+          and jf["evaluation"]["first_reason"] == C.REASON_COMMAND_OUT_OF_SCOPE)
+
+    # 4.3 页面间隙替换请求（设备/命令/载荷）→ MISMATCH，不驱动
+    keys, levels = fresh_keys_and_levels()
+    p_orig = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    b_orig = envelope(keys, levels, p_orig)
+    _, jt = post_json("/api/credential/issue", b_orig)
+    tok = jt["credential"]["token_id"]
+    p_swap = {"device": "dev-a", "command": "reboot", "nonce": os.urandom(8).hex()}
+    b_swap = envelope(keys, levels, p_swap)
+    _, jm = post_json("/api/credential/confirm", {"token_id": tok, **b_swap})
+    check("确认时命令变化 → MISMATCH 且无回执不驱动",
+          jm.get("accepted") is False and jm.get("receipt") is None
+          and jm["evaluation"]["first_reason"] == C.REASON_CONFIRM_TOKEN_MISMATCH
+          and jm["credential"]["status"] == "ISSUED",
+          str(jm))
+    _, jok = post_json("/api/credential/confirm", {"token_id": tok, **b_orig})
+    check("原绑定请求随后仍只执行一次",
+          jok.get("accepted") is True and jok["receipt"]["status"] == "EXECUTED")
+
+    # 4.4 篡改已签字段 / 未知凭据
+    _, jtam = post_json("/api/credential/confirm", {
+        "token_id": tok,
+        **envelope(keys, levels, p_orig, packet_mut=lambda p, c, k: p["chain"][-1]["header"]["devices"].append("dev-z")),
+    })
+    check("确认时篡改已签字段 → SIGNATURE_INVALID 不驱动",
+          jtam.get("accepted") is False
+          and jtam["evaluation"]["first_reason"] == C.REASON_SIGNATURE_INVALID)
+    code404, jnf = post_json("/api/credential/confirm", {"token_id": "0" * 32, **b_orig})
+    check("未知凭据 → NOT_FOUND 拒绝",
+          jnf.get("accepted") is False
+          and jnf["evaluation"]["first_reason"] == C.REASON_CONFIRM_TOKEN_NOT_FOUND)
+
+    # 4.5 凭据未使用期间链项被撤销：旧凭据不得绕过安全检查
+    keys, levels = fresh_keys_and_levels()
+    pv = {"device": "dev-a", "command": "status", "nonce": os.urandom(8).hex()}
+    bv = envelope(keys, levels, pv)
+    _, jv = post_json("/api/credential/issue", bv)
+    tv = jv["credential"]["token_id"]
+    chain = testkit.make_chain(keys["root"], levels, FAR_FUTURE)
+    leaf_id = C.item_id_of(chain[-1]["header"])
+    crl = testkit.make_revocation(keys["root"], [leaf_id], FAR_FUTURE)
+    packet_rev = testkit.make_packet(keys["root"], chain, revocations=[crl])
+    httpx.post(BASE_URL + "/api/execute", json={
+        "packet_text": canonicalize(packet_rev), "request_text": bv["request_text"],
+    }, timeout=TIMEOUT)
+    _, jvr = post_json("/api/credential/confirm", {"token_id": tv, **bv})
+    check("撤销后旧凭据确认 → REVOKED 不执行",
+          jvr.get("accepted") is False
+          and jvr["evaluation"]["first_reason"] == C.REASON_REVOKED
+          and jvr.get("receipt", {}).get("status") == "REJECTED")
+
+    # 4.6 两个页面并发同一凭据同一请求 → 一次执行、同一回执
+    keys, levels = fresh_keys_and_levels()
+    pc = {"device": "dev-b", "command": "reboot", "nonce": os.urandom(8).hex()}
+    bc = envelope(keys, levels, pc)
+    _, jcc = post_json("/api/credential/issue", bc)
+    tc = jcc["credential"]["token_id"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        crs = list(pool.map(
+            lambda _: post_json("/api/credential/confirm", {"token_id": tc, **bc}),
+            range(12)))
+    creceipts = {json.dumps(j.get("receipt"), sort_keys=True) for _, j in crs}
+    cfirsts = [j for _, j in crs if j.get("duplicate") is False]
+    check("并发凭据确认全部 200 且同一回执", {c for c, _ in crs} == {200} and len(creceipts) == 1)
+    check("并发凭据确认恰好一次首执行", len(cfirsts) == 1, f"firsts={len(cfirsts)}")
+
+
 def scenario_http_smoke() -> None:
-    print("\n=== 场景 4：健康/页面/内置演练包冒烟 ===")
+    print("\n=== 场景 5：健康/页面/内置演练包冒烟 ===")
     h = httpx.get(BASE_URL + "/healthz", timeout=TIMEOUT)
     check("GET /healthz → 200 status=ok",
           h.status_code == 200 and h.json().get("status") == "ok")
@@ -240,7 +350,7 @@ def scenario_http_smoke() -> None:
 
 
 def run_pytest_suite() -> bool:
-    print("\n=== 场景 5：pytest 全量单元/集成测试 ===")
+    print("\n=== 场景 6：pytest 全量单元/集成测试 ===")
     env = os.environ.copy()
     env["MDMS_DB_PATH"] = "/tmp/mdms-verify.db"
     env["PYTHONPATH"] = str(SRV_DIR)
@@ -260,6 +370,7 @@ def main() -> int:
     scenario_valid_execution_and_retry()
     scenario_concurrent_retransmit()
     scenario_tamper_rejections()
+    scenario_execution_credentials()
     scenario_http_smoke()
     pytest_ok = run_pytest_suite()
 
